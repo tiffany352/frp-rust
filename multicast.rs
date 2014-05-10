@@ -1,45 +1,60 @@
 use std::task;
-use std::rt::comm::*;
+use std::comm::{Sender, Receiver, channel};
 
-pub struct MultiPort<T>(Chan<Chan<T>>);
+pub struct MultiReceiver<T> {
+    sender: Sender<Sender<T>>,
+}
 
-impl<T:Clone+Send> MultiPort<T> {
-    pub fn new(port: Port<T>) -> MultiPort<T> {
-        let (chanport, chanchan) = stream();
-        let (xport, xchan): (Port<Either<T,Chan<T>>>, Chan<Either<T,Chan<T>>>) = stream();
-        let xchan = SharedChan::new(xchan);
-        do task::spawn_with((xchan.clone(), port)) |(chan, port)| {
+enum Either<L,R> {
+    Left(L),
+    Right(R),
+}
+
+impl<T: Clone + Send> MultiReceiver<T> {
+    pub fn new(port: Receiver<T>) -> MultiReceiver<T> {
+        let (chanchan, chanport) = channel();
+        let (xchan, xport) = channel();
+
+        let xchan1 = xchan.clone();
+        task::spawn(proc() {
             loop {
-                match port.try_recv() {
-                    Some(x) => chan.send(Left(x)),
-                    None => break
+                match port.recv_opt() {
+                    Ok(x) => { xchan1.send(Left(x)); }
+                    Err(()) => { break; }
                 }
             }
-        }
-        do task::spawn_with((xchan, chanport)) |(chan, port)| {
+        });
+
+        let xchan2 = xchan.clone();
+        task::spawn(proc() {
             loop {
-                match port.try_recv() {
-                    Some(x) => chan.send(Right(x)),
-                    None => break
+                match chanport.recv_opt() {
+                    Ok(x) => { xchan2.send(Right(x)); }
+                    Err(()) => { break; }
                 }
             }
-        }
-        do task::spawn_with(xport) |port| {
-            let mut chans: ~[Chan<T>] = ~[];
+        });
+
+        task::spawn(proc() {
+            let mut chans: Vec<Sender<T>> = Vec::new();
             loop {
-                match port.try_recv() {
-                    Some(Left(x)) => for c in chans.iter() {
-                        c.send(x.clone())
-                    },
-                    Some(Right(x)) => chans.push(x),
-                    None => break
+                match xport.recv_opt() {
+                    Ok(Left(x)) => {
+                        for c in chans.iter() {
+                            c.send(x.clone())
+                        }
+                    }
+                    Ok(Right(x)) => { chans.push(x); }
+                    Err(()) => { break; }
                 }
             }
-        }
-        MultiPort(chanchan)
+        });
+
+        MultiReceiver { sender: chanchan }
     }
-    pub fn add(&self, chan: Chan<T>) {
-        self.send(chan)
+
+    pub fn add(&self, chan: Sender<T>) {
+        self.sender.send(chan)
     }
 }
 

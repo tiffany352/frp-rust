@@ -1,56 +1,80 @@
 use std::task;
-use std::rt::comm::*;
-use multicast::*;
+//use std::rt::comm::*;
+//use multicast::*;
+use std::comm::channel;
+use multicast::MultiReceiver;
 
-pub struct Signal<T>(MultiPort<T>);
-
-pub fn lift<T:Send+Clone,U:Send+Clone>(sig: &Signal<T>, func: ~fn(T) -> U) -> Signal<U> {
-    let (port, chan) = stream();
-    sig.add(chan);
-    let (mport, mchan) = stream();
-    do task::spawn_with((port, mchan, func)) |(port, chan, func)| {
-        loop {
-            match port.try_recv() {
-                Some(x) => chan.send(func(x)),
-                None => break
-            }
-        }
-    }
-    Signal(MultiPort::new(mport))
+pub struct Signal<T> {
+    receiver: MultiReceiver<T>,
 }
 
-pub fn lift2<T1:Send+Clone,T2:Send+Clone,U:Send+Clone>(sig1: &Signal<T1>, sig2: &Signal<T2>, func: ~fn(T1,T2) -> U) -> Signal<U> {
-    let (port, chan) = stream();
-    let (xport, xchan): (Port<Either<T1,T2>>, Chan<Either<T1,T2>>) = stream();
-    let (mport1, mchan1) = stream();
-    let (mport2, mchan2) = stream();
-    sig1.add(mchan1);
-    sig2.add(mchan2);
-    let xchan = SharedChan::new(xchan);
-    do task::spawn_with((mport1, xchan.clone())) |(port, chan)| {
+enum Either<L,R> {
+    Left(L),
+    Right(R),
+}
+
+pub fn lift<T: Send + Clone, U: Send + Clone>(sig: &Signal<T>, func: extern fn(T) -> U) -> Signal<U> {
+    let (chan, port) = channel();
+    sig.receiver.add(chan);
+    let (mchan, mport) = channel();
+    task::spawn(proc() {
         loop {
-            match port.try_recv() {
-                Some(x) => {println("port1");chan.send(Left(x))},
-                None => break
+            match port.recv_opt() {
+                Ok(x) => { mchan.send(func(x)); }
+                Err(()) => { break; }
             }
         }
+    });
+    Signal {
+        receiver: MultiReceiver::new(mport),
     }
-    do task::spawn_with((mport2, xchan)) |(port, chan)| {
+}
+
+pub fn lift2<T1:Send+Clone,T2:Send+Clone,U:Send+Clone>(sig1: &mut Signal<T1>, sig2: &Signal<T2>, func: extern fn(T1,T2) -> U) -> Signal<U> {
+    let (chan, port) = channel();
+    let (xchan, xport): (Sender<Either<T1,T2>>, Receiver<Either<T1,T2>>) = channel();
+    let (mchan1, mport1) = channel();
+    let (mchan2, mport2) = channel();
+    sig1.receiver.add(mchan1);
+    sig2.receiver.add(mchan2);
+
+    let xchan1 = xchan.clone();
+    task::spawn(proc() {
         loop {
-            match port.try_recv() {
-                Some(x) => {println("port2");chan.send(Right(x))},
-                None => break
+            match mport1.recv_opt() {
+                Ok(x) => {
+                    println!("port1");
+                    xchan1.send(Left(x));
+                }
+                Err(()) => { break; }
             }
         }
-    }
-    do task::spawn_with((xport, chan, func)) |(port, chan, func)| {
+    });
+
+    let xchan2 = xchan.clone();
+    task::spawn(proc() {
+        loop {
+            match mport2.recv_opt() {
+                Ok(x) => {
+                    println!("port2");
+                    xchan2.send(Right(x));
+                },
+                Err(()) => { break; }
+            }
+        }
+    });
+
+    task::spawn(proc() {
         let mut x = None;
         let mut y = None;
         loop {
-            match port.try_recv() {
-                Some(Left(v)) => x = Some(v),
-                Some(Right(v)) => y = Some(v),
-                None => {println("???"); break}
+            match xport.recv_opt() {
+                Ok(Left(v)) => x = Some(v),
+                Ok(Right(v)) => y = Some(v),
+                Err(()) => {
+                    println!("???");
+                    break;
+                }
             }
             match (x.clone(), y.clone()) {
                 (Some(a), Some(b)) => {
@@ -61,17 +85,19 @@ pub fn lift2<T1:Send+Clone,T2:Send+Clone,U:Send+Clone>(sig1: &Signal<T1>, sig2: 
                 _ => ()
             }
         }
+    });
+
+    Signal {
+        receiver: MultiReceiver::new(port)
     }
-    Signal(MultiPort::new(port))
 }
 
-fn constant<T:Clone+Send>(val: T) -> (Chan<()>, Signal<T>) {
-    let (port, chan) = stream();
-    let (mport, mchan) = stream();
-    do task::spawn_with((port, mchan)) |(port, chan)| {
+fn constant<T:Clone+Send>(val: T) -> (Sender<()>, Signal<T>) {
+    let (chan, port) = channel();
+    let (mchan, mport) = channel();
+    task::spawn(proc() {
         port.recv();
-        chan.send(val.clone());
-    }
-    (chan, Signal(MultiPort::new(mport)))
+        mchan.send(val.clone());
+    });
+    (chan, Signal { receiver: MultiReceiver::new(mport) })
 }
-
